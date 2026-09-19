@@ -850,7 +850,14 @@ pub struct TextStyle {
     /// snapshotted from the first non-empty line.
     pub content: String,
     /// CSS-style family name, quotes included where the name needs them,
-    /// e.g. `"Cabinet Grotesk"`. May name a [`CustomFont`] the user added.
+    /// e.g. `"Hanken Grotesk"`. May name a [`CustomFont`] the user added.
+    ///
+    /// The default names the face the build carries and the window is set
+    /// in; it used to name a face nothing has - the app bundles no such
+    /// file and no machine installs one - so every title made by default
+    /// painted in the system's sans-serif while saying otherwise. A
+    /// document naming a face this build retired is painted in the carried
+    /// one too; see `concat_text::Fonts`.
     pub font_family: String,
     /// Cap height as a fraction of frame height.
     pub font_size: f64,
@@ -922,7 +929,7 @@ impl Default for TextStyle {
     fn default() -> Self {
         Self {
             content: "Your text".to_owned(),
-            font_family: "\"Cabinet Grotesk\"".to_owned(),
+            font_family: "\"Hanken Grotesk\"".to_owned(),
             font_size: 0.09,
             font_weight: 700.0,
             italic: false,

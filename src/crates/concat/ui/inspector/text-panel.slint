@@ -201,6 +201,11 @@ export component TextPanel inherits VerticalLayout {
             Select {
                 options: root.families;
                 current: root.family-index;
+                // A family the list does not have - one a project was made
+                // with and this machine has never heard of - still reads as
+                // itself rather than as nothing: the trigger falls back to
+                // the placeholder, and this is the clip's own answer.
+                placeholder: root.selected.font-family;
                 changed(index) => { root.pick-font(root.families[index]); }
             }
         }
