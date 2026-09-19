@@ -621,6 +621,11 @@ export component PreviewPane inherits Rectangle {
     in property <string> clip-name;
     /// The decoded frame. Drawn fitted to the stage when there is one.
     in property <image> frame;
+    /// A fade to a colour at the playhead, as a wash over that frame: the
+    /// colour to lay on it and how opaque the wash is there. The engine
+    /// cannot bake those fades for the monitor, so the monitor draws them.
+    in property <color> veil-colour: transparent;
+    in property <float> veil-opacity;
     /// Every picture under the playhead, for the selection drawn over the
     /// frame. See StageOverlay.
     in property <[StageItemData]> stage-items;
@@ -899,6 +904,18 @@ export component PreviewPane inherits Rectangle {
                     height: parent.height;
                     source: root.frame;
                     image-fit: contain;
+                }
+
+                // A fade to a colour, washed over the frame it is fading.
+                // The engine bakes those for the export only; the monitor
+                // draws the same shape here.
+                if root.has-picture && root.frame.width > 0 && root.veil-opacity > 0: Rectangle {
+                    x: 0;
+                    y: 0;
+                    width: parent.width;
+                    height: parent.height;
+                    background: root.veil-colour;
+                    opacity: root.veil-opacity;
                 }
             }
 

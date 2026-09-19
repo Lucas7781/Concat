@@ -110,6 +110,79 @@ fn preview_delay(since: Option<std::time::Duration>) -> Option<std::time::Durati
     }
 }
 
+/// A fade to a colour at `playhead`, for the monitor to lay over its frame:
+/// the colour and how opaque the wash is there. None anywhere else, which is
+/// everywhere but half a transition's length either side of a cut.
+///
+/// The engine bakes those fades into the decoder's filter chain, whose frame
+/// numbers count from the clip's start - true of the export, which opens a
+/// decoder at each clip's in-point, and not of the monitor, which seeks
+/// through a pool. So the export draws the fade and the monitor draws the
+/// same shape here: nothing at either end of the window, solid at the cut,
+/// and the outgoing clip's half clamped to its own length exactly as the
+/// filter clamps it. `frame` is the output's frame length in seconds, the
+/// adjacency tolerance the exporter judges a cut by.
+///
+/// ponytail: the wash covers the whole monitor, so a fade on a track under
+/// another track's picture tints that picture too. The exporter fades the
+/// clip, not the composite; move the fade into the frame plan (a
+/// `Transition::FadeTo` per layer, which both compositors already draw) when
+/// that matters.
+fn veil_at(timeline: &Timeline, playhead: f64, frame: f64) -> Option<(slint::Color, f32)> {
+    let visible = |track_id: &str| {
+        timeline
+            .tracks
+            .iter()
+            .find(|track| track.id == track_id)
+            .is_some_and(|track| track.visible)
+    };
+    for clip in &timeline.clips {
+        let Some(transition) = clip.transition_in.as_ref() else {
+            continue;
+        };
+        let colour = match transition.id.as_str() {
+            "fade-black" => [0u8, 0, 0],
+            "fade-white" => [255, 255, 255],
+            _ => continue,
+        };
+        if !clip.kind.is_visual() || !visible(&clip.track_id) {
+            continue;
+        }
+        // A fade sits on a cut, so it needs the other half of one: a clip
+        // ending where this one starts, on its lane. Without it the exporter
+        // drops the fade, and so does the monitor.
+        let cut = clip.start;
+        let outgoing = timeline.clips.iter().find(|other| {
+            other.track_id == clip.track_id
+                && other.kind.is_visual()
+                && visible(&other.track_id)
+                && (other.start + other.duration - cut).abs() < frame / 2.0
+        });
+        let Some(outgoing) = outgoing else {
+            continue;
+        };
+        let half = transition.duration.max(0.0) / 2.0;
+        // Each side fades from nothing to solid at the cut over its own half
+        // - the shorter of that and the clip the half sits on, which is the
+        // fuse the exporter bakes.
+        let (fuse, elapsed) = if playhead <= cut {
+            let fuse = half.min(outgoing.duration);
+            (fuse, playhead - (cut - fuse))
+        } else {
+            let fuse = half.min(clip.duration);
+            (fuse, cut + fuse - playhead)
+        };
+        if fuse <= 0.0 || elapsed < 0.0 || elapsed > fuse {
+            continue;
+        }
+        return Some((
+            slint::Color::from_rgb_u8(colour[0], colour[1], colour[2]),
+            (elapsed / fuse).clamp(0.0, 1.0) as f32,
+        ));
+    }
+    None
+}
+
 /// One media item's filmstrip, as the lanes tile it.
 pub struct Strip {
     /// Every sampled frame side by side.
@@ -2709,6 +2782,15 @@ impl Studio {
                 ..ClipPatch::default()
             },
         });
+    }
+
+    /// What the monitor washes over its frame at `playhead`: a fade to black
+    /// or white the engine draws for the export but not for the monitor. See
+    /// [`veil_at`].
+    pub fn preview_veil(&self, playhead: f64) -> (slint::Color, f32) {
+        let frame = 1.0 / f64::from(self.frame_rate().max(1.0));
+        veil_at(self.timeline(), playhead, frame)
+            .unwrap_or((slint::Color::from_argb_u8(0, 0, 0, 0), 0.0))
     }
 
     /// Drops one entry from the selected clip's chains, by the row id the
@@ -5679,6 +5761,9 @@ impl Studio {
         editor.set_playhead_free(!self.prefs.playhead_stops_at_end);
         editor.set_playing(self.playing);
         editor.set_preview_frame(self.monitor.image.clone());
+        let (veil, veil_opacity) = self.preview_veil(playhead);
+        editor.set_preview_veil_colour(veil);
+        editor.set_preview_veil_opacity(veil_opacity);
         sync(&models.stage, self.stage_items());
         sync(&models.guides, self.stage_guides.clone());
         let (path, width, erase) = self.stroke_overlay();
@@ -7143,9 +7228,76 @@ impl Studio {
 
 #[cfg(test)]
 mod tests {
-    use super::{Footprint, PREVIEW_EVERY, Studio, preview_delay};
+    use super::{Footprint, PREVIEW_EVERY, Studio, preview_delay, veil_at};
+    use concat_project::model::{Clip, ClipKind, Timeline, Track, Transition};
 
     const FRAME: (u32, u32) = (1920, 1080);
+
+    /// A fade to a colour washes the monitor: nothing at either end of its
+    /// window, solid at the cut, and only where a clip ends at that cut.
+    #[test]
+    fn a_fade_to_a_colour_washes_the_monitor_at_its_cut() {
+        let mut timeline = Timeline {
+            tracks: vec![Track {
+                id: "V1".to_owned(),
+                ..Track::default()
+            }],
+            ..Timeline::default()
+        };
+        let mut incoming = Clip::blank("c2", "V1", ClipKind::Video, "b", 4.0, 4.0);
+        incoming.transition_in = Some(Transition {
+            id: "fade-black".to_owned(),
+            duration: 1.0,
+        });
+        timeline.clips = vec![
+            std::sync::Arc::new(Clip::blank("c1", "V1", ClipKind::Video, "a", 0.0, 4.0)),
+            std::sync::Arc::new(incoming),
+        ];
+
+        // Half a second each side of the cut at 4s, solid on it and clear
+        // at either end of the window.
+        let wash = |at| veil_at(&timeline, at, 1.0 / 30.0).map(|(_, opacity)| opacity);
+        assert_eq!(wash(4.0), Some(1.0));
+        assert_eq!(wash(4.25), Some(0.5));
+        assert_eq!(wash(3.75), Some(0.5));
+        assert_eq!(wash(3.5), Some(0.0));
+        assert_eq!(wash(4.5), Some(0.0));
+        assert_eq!(wash(3.49), None);
+        assert_eq!(wash(4.51), None);
+
+        // White names white; a transition the engine cuts instead of
+        // fading has no wash at all.
+        timeline.clips[1] = std::sync::Arc::new(Clip {
+            transition_in: Some(Transition {
+                id: "fade-white".to_owned(),
+                duration: 1.0,
+            }),
+            ..(*timeline.clips[1]).clone()
+        });
+        let white = veil_at(&timeline, 4.0, 1.0 / 30.0).unwrap().0;
+        assert_eq!((white.red(), white.green(), white.blue()), (255, 255, 255));
+        timeline.clips[1] = std::sync::Arc::new(Clip {
+            transition_in: Some(Transition {
+                id: "cross-fade".to_owned(),
+                duration: 1.0,
+            }),
+            ..(*timeline.clips[1]).clone()
+        });
+        assert!(veil_at(&timeline, 4.0, 1.0 / 30.0).is_none());
+
+        // A cut needs a clip on the other side of it: with nothing ending
+        // at 4s the exporter drops the fade, and so does the monitor.
+        timeline.clips[1] = std::sync::Arc::new(Clip {
+            transition_in: Some(Transition {
+                id: "fade-black".to_owned(),
+                duration: 1.0,
+            }),
+            ..(*timeline.clips[1]).clone()
+        });
+        timeline.clips[0] =
+            std::sync::Arc::new(Clip::blank("c1", "V1", ClipKind::Video, "a", 0.0, 3.0));
+        assert!(veil_at(&timeline, 4.0, 1.0 / 30.0).is_none());
+    }
 
     /// A quarter turn swaps the bounds' pixel extents, which in fractions
     /// of a 16:9 frame is not a swap of the numbers.

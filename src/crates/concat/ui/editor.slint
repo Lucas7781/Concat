@@ -188,6 +188,13 @@ export global Editor {
     /// The engine's composited frame at the playhead, or an empty image
     /// while one is on its way. Set from Rust; see `Studio::request_preview`.
     in-out property <image> preview-frame;
+    /// The wash a fade to black or white puts over that frame, and how
+    /// opaque it is there. The engine bakes those fades into the decoder's
+    /// chain, whose frame numbers assume a decode from the clip's start -
+    /// which the monitor's pooled seeks do not do - so the monitor draws the
+    /// same shape itself. Set from Rust; see `Studio::preview_veil`.
+    in-out property <color> preview-veil-colour: transparent;
+    in-out property <float> preview-veil-opacity;
 
     callback play-toggled();
     callback seek(seconds: float);
