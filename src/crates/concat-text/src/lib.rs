@@ -29,7 +29,9 @@
 //! stores them, so a title looks the same at 720p and 4K. Everything here
 //! converts to pixels once, at the top.
 
+use std::collections::HashMap;
 use std::fmt;
+use std::sync::{Arc, Mutex};
 
 use tiny_skia::{
     Color, FillRule, LineCap, LineJoin, Paint, Path, PathBuilder, Pixmap, PixmapPaint, Rect,
@@ -184,10 +186,121 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+/// The families a glyph the chosen one has no glyph for is looked for in, in
+/// the order they are tried.
+///
+/// Japanese first, then Korean, then Chinese: Han characters are shared
+/// between the three scripts and the shapes are not - 直 and 骨 are drawn
+/// differently in each - and a title with a kanji in it is more often
+/// Japanese. Nothing is lost to the order: a Korean face carries no kana and
+/// a Chinese one no hangul, so each script still lands on a face that knows
+/// it, and a title set in a Chinese or Korean family keeps that family for
+/// the characters it has. The symbols at the end answer for the arrows and
+/// boxes a title sometimes needs.
+const FALLBACK_FAMILIES: &[&str] = &[
+    // Japanese.
+    "Yu Gothic",
+    "Meiryo",
+    "MS Gothic",
+    "MS Mincho",
+    "Yu Mincho",
+    "Hiragino Sans",
+    "Hiragino Kaku Gothic ProN",
+    "Noto Sans CJK JP",
+    "Noto Sans JP",
+    "Source Han Sans",
+    // Korean.
+    "Malgun Gothic",
+    "Batang",
+    "Gulim",
+    "Apple SD Gothic Neo",
+    "Noto Sans CJK KR",
+    "Noto Sans KR",
+    // Chinese.
+    "Microsoft YaHei",
+    "SimSun",
+    "SimHei",
+    "PingFang SC",
+    "Noto Sans CJK SC",
+    "Noto Sans SC",
+    // The rest of Unicode's boxes, arrows and signs.
+    "Segoe UI Symbol",
+    "Noto Sans Symbols",
+    "Noto Sans Symbols 2",
+];
+
+/// One face's bytes, and which face of a collection it is. What both the
+/// shaper and the outliner want, kept once the file has been read.
+struct Blob {
+    data: Vec<u8>,
+    index: u32,
+}
+
+impl Blob {
+    /// Whether this face has a glyph for `ch`.
+    fn covers(&self, ch: char) -> bool {
+        ttf_parser::Face::parse(&self.data, self.index)
+            .map(|face| face.glyph_index(ch).is_some())
+            .unwrap_or(false)
+    }
+
+    fn shape(&self) -> Option<rustybuzz::Face<'_>> {
+        rustybuzz::Face::from_slice(&self.data, self.index)
+    }
+}
+
 /// The faces available to titles: the system's, plus any files a project
 /// carries. Built once and kept; loading the system's fonts is the slow part.
 pub struct Fonts {
     db: fontdb::Database,
+    /// The faces read so far, by id. A title is painted again on every
+    /// keystroke of its words and every frame of a drag, and reading a font
+    /// file is megabytes each time.
+    blobs: Mutex<HashMap<fontdb::ID, Option<Arc<Blob>>>>,
+}
+
+/// What one title is set in: the face the style chose, and the weight and
+/// slant a stand-in for a character it lacks has to match.
+#[derive(Clone, Copy)]
+struct Faces<'a> {
+    fonts: &'a Fonts,
+    /// The chosen face, where it has the glyph.
+    primary: fontdb::ID,
+    weight: fontdb::Weight,
+    slant: fontdb::Style,
+}
+
+impl Faces<'_> {
+    /// The face for `ch`: the chosen one where it has the glyph, otherwise
+    /// the first face in [`FALLBACK_FAMILIES`] that does, at the same weight
+    /// and slant so a bold title gets bold stand-ins. The chosen face when
+    /// nothing on this machine has it, so the character shows the
+    /// missing-glyph box rather than vanishing.
+    fn face_for(&self, ch: char) -> fontdb::ID {
+        if let Some(blob) = self.fonts.blob(self.primary)
+            && blob.covers(ch)
+        {
+            return self.primary;
+        }
+        for family in FALLBACK_FAMILIES {
+            let query = fontdb::Query {
+                families: &[fontdb::Family::Name(family)],
+                weight: self.weight,
+                stretch: fontdb::Stretch::Normal,
+                style: self.slant,
+            };
+            let Some(id) = self.fonts.db.query(&query) else {
+                continue;
+            };
+            if id != self.primary
+                && let Some(blob) = self.fonts.blob(id)
+                && blob.covers(ch)
+            {
+                return id;
+            }
+        }
+        self.primary
+    }
 }
 
 impl Default for Fonts {
@@ -222,7 +335,10 @@ impl Fonts {
         for face in BUNDLED {
             db.load_font_data(face.to_vec());
         }
-        Fonts { db }
+        Fonts {
+            db,
+            blobs: Mutex::new(HashMap::new()),
+        }
     }
 
     /// Adds one font file. A file that does not parse is skipped; a title
@@ -231,9 +347,25 @@ impl Fonts {
         self.db.load_font_file(path).is_ok()
     }
 
+    /// Every family these fonts offer, once each and in order: what a font
+    /// picker lists. The first name of each face, which is the name a style
+    /// should give it - a face lists its family in every language it knows,
+    /// and the rest are aliases for the same words.
+    pub fn families(&self) -> Vec<String> {
+        let mut families: Vec<String> = self
+            .db
+            .faces()
+            .filter_map(|face| face.families.first().map(|(name, _)| name.clone()))
+            .filter(|name| !name.is_empty())
+            .collect();
+        families.sort();
+        families.dedup();
+        families
+    }
+
     /// The best face for a style: the named family at the nearest weight and
     /// slant, then any sans-serif, then anything at all.
-    fn pick(&self, style: &TitleStyle) -> Result<Vec<u8>, Error> {
+    fn pick(&self, style: &TitleStyle) -> Result<(fontdb::ID, Arc<Blob>), Error> {
         let mut family = style
             .font_family
             .trim()
@@ -242,12 +374,6 @@ impl Fonts {
         if RETIRED.contains(&family) {
             family = BUNDLED_FAMILY;
         }
-        let weight = fontdb::Weight(style.font_weight.clamp(100.0, 900.0).round() as u16);
-        let slant = if style.italic {
-            fontdb::Style::Italic
-        } else {
-            fontdb::Style::Normal
-        };
         let mut families: Vec<fontdb::Family<'_>> = Vec::new();
         if !family.is_empty() {
             families.push(fontdb::Family::Name(family));
@@ -255,30 +381,51 @@ impl Fonts {
         families.push(fontdb::Family::SansSerif);
         let query = fontdb::Query {
             families: &families,
-            weight,
+            weight: weight_of(style),
             stretch: fontdb::Stretch::Normal,
-            style: slant,
+            style: slant_of(style),
         };
         let id = self
             .db
             .query(&query)
             .or_else(|| self.db.faces().next().map(|face| face.id))
             .ok_or(Error::NoFont)?;
-        // Copied out: the shaper and the outliner both want a slice that
-        // outlives the database borrow, and a face is a few hundred KB.
-        self.db
+        let blob = self.blob(id).ok_or(Error::BadFont)?;
+        Ok((id, blob))
+    }
+
+    /// One face's bytes, read once and kept. `None` for a face whose file
+    /// will not parse as a font.
+    fn blob(&self, id: fontdb::ID) -> Option<Arc<Blob>> {
+        let mut blobs = self.blobs.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(known) = blobs.get(&id) {
+            return known.clone();
+        }
+        let read = self
+            .db
             .with_face_data(id, |data, index| {
-                // Multi-face collections: keep only the face that answered.
-                // rustybuzz takes the index, so the whole blob travels.
-                (data.to_vec(), index)
+                Arc::new(Blob {
+                    data: data.to_vec(),
+                    index,
+                })
             })
-            .map(|(data, index)| {
-                // Encode the index in front so the caller can hand both on.
-                let mut out = index.to_le_bytes().to_vec();
-                out.extend(data);
-                out
-            })
-            .ok_or(Error::BadFont)
+            .filter(|blob| blob.shape().is_some());
+        blobs.insert(id, read.clone());
+        read
+    }
+}
+
+/// The weight a style asks for, as the database names it.
+fn weight_of(style: &TitleStyle) -> fontdb::Weight {
+    fontdb::Weight(style.font_weight.clamp(100.0, 900.0).round() as u16)
+}
+
+/// The slant a style asks for.
+fn slant_of(style: &TitleStyle) -> fontdb::Style {
+    if style.italic {
+        fontdb::Style::Italic
+    } else {
+        fontdb::Style::Normal
     }
 }
 
@@ -347,15 +494,9 @@ impl ttf_parser::OutlineBuilder for Outliner<'_> {
 /// A paragraph as the lines it wraps to within `max_w` pixels: words are
 /// added while they fit, and a word that fits nowhere gets a line of its
 /// own rather than being cut. No limit, one line.
-fn wrap_line(
-    face: &rustybuzz::Face<'_>,
-    text: &str,
-    em: f32,
-    tracking: f32,
-    max_w: f32,
-) -> Vec<Line> {
+fn wrap_line(faces: Faces<'_>, text: &str, em: f32, tracking: f32, max_w: f32) -> Vec<Line> {
     if text.trim().is_empty() {
-        return vec![shape_line(face, text, em, tracking)];
+        return vec![shape_line(faces, text, em, tracking)];
     }
     // Word boundaries as byte ranges into `text`, so a growing candidate is
     // a real prefix of the source - keeping its own inter-word spacing -
@@ -377,10 +518,10 @@ fn wrap_line(
 
     let mut lines = Vec::new();
     let mut line_start = bounds[0].0;
-    let mut shaped = shape_line(face, "", em, tracking);
+    let mut shaped = shape_line(faces, "", em, tracking);
     let mut words: Vec<(f32, f32)> = Vec::new();
     for &(word_start, word_end) in &bounds {
-        let trial = shape_line(face, &text[line_start..word_end], em, tracking);
+        let trial = shape_line(faces, &text[line_start..word_end], em, tracking);
         // A word that fits nowhere still gets a line of its own.
         if max_w <= 0.0 || trial.width <= max_w || words.is_empty() {
             words.push((shaped.width, trial.width));
@@ -389,7 +530,7 @@ fn wrap_line(
             shaped.words = std::mem::take(&mut words);
             lines.push(shaped);
             line_start = word_start;
-            shaped = shape_line(face, &text[line_start..word_end], em, tracking);
+            shaped = shape_line(faces, &text[line_start..word_end], em, tracking);
             words.push((0.0, shaped.width));
         }
     }
@@ -398,7 +539,15 @@ fn wrap_line(
     lines
 }
 
-fn shape_line(face: &rustybuzz::Face<'_>, text: &str, em: f32, tracking: f32) -> Line {
+/// Shapes one line as the runs it is made of: each stretch of text with a
+/// face that has its glyphs - the chosen one where it does, a fallback face
+/// where it does not - laid down one after another on a single pen.
+///
+/// One pen, one line: a kanji in the middle of a title sits on the same
+/// baseline as the words around it, counts towards the block's width so the
+/// wrapping still sees the whole line, and is painted by a face that knows
+/// the character instead of showing a missing-glyph box.
+fn shape_line(faces: Faces<'_>, text: &str, em: f32, tracking: f32) -> Line {
     if text.is_empty() {
         return Line {
             path: None,
@@ -406,26 +555,30 @@ fn shape_line(face: &rustybuzz::Face<'_>, text: &str, em: f32, tracking: f32) ->
             words: Vec::new(),
         };
     }
-    let scale = em / face.units_per_em() as f32;
-    let mut buffer = rustybuzz::UnicodeBuffer::new();
-    buffer.push_str(text);
-    let shaped = rustybuzz::shape(face, &[], buffer);
     let mut builder = PathBuilder::new();
     let mut pen = 0.0_f32;
-    for (info, position) in shaped
-        .glyph_infos()
-        .iter()
-        .zip(shaped.glyph_positions().iter())
-    {
-        let glyph = ttf_parser::GlyphId(info.glyph_id as u16);
-        let mut outliner = Outliner {
-            builder: &mut builder,
-            scale,
-            x: pen + position.x_offset as f32 * scale,
-            y: -(position.y_offset as f32 * scale),
-        };
-        face.outline_glyph(glyph, &mut outliner);
-        pen += position.x_advance as f32 * scale + tracking;
+    let mut run: Option<(fontdb::ID, usize)> = None;
+    for (at, ch) in text.char_indices() {
+        let face = faces.face_for(ch);
+        match run {
+            Some((held, from)) if held != face => {
+                pen = shape_run(
+                    faces,
+                    held,
+                    &text[from..at],
+                    &mut builder,
+                    pen,
+                    em,
+                    tracking,
+                );
+                run = Some((face, at));
+            }
+            None => run = Some((face, at)),
+            Some(_) => {}
+        }
+    }
+    if let Some((face, from)) = run {
+        pen = shape_run(faces, face, &text[from..], &mut builder, pen, em, tracking);
     }
     // The tracking after the last glyph is air nobody sees.
     let width = (pen - tracking).max(0.0);
@@ -434,6 +587,46 @@ fn shape_line(face: &rustybuzz::Face<'_>, text: &str, em: f32, tracking: f32) ->
         width,
         words: Vec::new(),
     }
+}
+
+/// Shapes one run with one face onto `builder` at the pen, and returns the
+/// pen where the run left it. A face whose data has gone is worth no glyphs
+/// and no advance: the run is skipped and the rest of the line is drawn.
+fn shape_run(
+    faces: Faces<'_>,
+    face_id: fontdb::ID,
+    text: &str,
+    builder: &mut PathBuilder,
+    mut pen: f32,
+    em: f32,
+    tracking: f32,
+) -> f32 {
+    let Some(blob) = faces.fonts.blob(face_id) else {
+        return pen;
+    };
+    let Some(face) = blob.shape() else {
+        return pen;
+    };
+    let scale = em / face.units_per_em() as f32;
+    let mut buffer = rustybuzz::UnicodeBuffer::new();
+    buffer.push_str(text);
+    let shaped = rustybuzz::shape(&face, &[], buffer);
+    for (info, position) in shaped
+        .glyph_infos()
+        .iter()
+        .zip(shaped.glyph_positions().iter())
+    {
+        let glyph = ttf_parser::GlyphId(info.glyph_id as u16);
+        let mut outliner = Outliner {
+            builder,
+            scale,
+            x: pen + position.x_offset as f32 * scale,
+            y: -(position.y_offset as f32 * scale),
+        };
+        face.outline_glyph(glyph, &mut outliner);
+        pen += position.x_advance as f32 * scale + tracking;
+    }
+    pen
 }
 
 /// A separable box blur over premultiplied RGBA, run twice for a soft
@@ -564,15 +757,8 @@ fn paint(
     let tracking = style.tracking as f32 * frame_h;
     let pitch = em * (style.line_height.max(0.5) as f32);
 
-    let blob = fonts.pick(style)?;
-    let (index_bytes, data) = blob.split_at(4);
-    let index = u32::from_le_bytes([
-        index_bytes[0],
-        index_bytes[1],
-        index_bytes[2],
-        index_bytes[3],
-    ]);
-    let face = rustybuzz::Face::from_slice(data, index).ok_or(Error::BadFont)?;
+    let (primary, blob) = fonts.pick(style)?;
+    let face = blob.shape().ok_or(Error::BadFont)?;
     let upem = face.units_per_em() as f32;
     let ascent = face.ascender() as f32 / upem * em;
     let descent = -(face.descender() as f32) / upem * em;
@@ -581,10 +767,16 @@ fn paint(
     // once the block's width is known. A paragraph wider than the style's
     // limit is wrapped at its spaces first.
     let max_w = (style.max_width as f32) * width as f32;
+    let faces = Faces {
+        fonts,
+        primary,
+        weight: weight_of(style),
+        slant: slant_of(style),
+    };
     let lines: Vec<Line> = style
         .content
         .lines()
-        .flat_map(|line| wrap_line(&face, line, em, tracking, max_w))
+        .flat_map(|line| wrap_line(faces, line, em, tracking, max_w))
         .collect();
     let rows = lines.len().max(1);
     let words_w = lines.iter().map(|line| line.width).fold(0.0, f32::max);
@@ -1003,15 +1195,16 @@ mod tests {
             .expect("the italic");
         let bundled = fonts
             .pick(&style(BUNDLED_FAMILY, 700.0, false))
-            .expect("bold");
+            .expect("bold")
+            .0;
         for retired in RETIRED {
             let picked = fonts.pick(&style(retired, 700.0, false)).expect("a face");
-            assert_eq!(picked, bundled, "{retired} is painted in the bundled face");
+            assert_eq!(picked.0, bundled, "{retired} is painted in the bundled face");
         }
         let quoted = fonts
             .pick(&style("\"Hanken Grotesk\"", 700.0, false))
             .expect("quotes stripped");
-        assert_eq!(quoted, bundled);
+        assert_eq!(quoted.0, bundled);
     }
 
     /// A missing family falls back to a system face and still paints words.
@@ -1097,5 +1290,124 @@ mod tests {
         let plated = render(&fonts, &plated, 640, 360).expect("renders");
         assert!(plated.block_width > one.block_width);
         assert!(plated.block_height > one.block_height);
+    }
+
+    /// Every family this machine has, as the data each one is drawn from:
+    /// what the tests below ask about faces rather than naming them, since
+    /// the families installed differ from one machine to the next.
+    fn installed() -> Vec<(String, Vec<u8>, u32)> {
+        let mut db = fontdb::Database::new();
+        db.load_system_fonts();
+        let mut out = Vec::new();
+        for face in db.faces() {
+            let Some((family, _)) = face.families.first() else {
+                continue;
+            };
+            if let Some((data, index)) =
+                db.with_face_data(face.id, |data, index| (data.to_vec(), index))
+            {
+                out.push((family.clone(), data, index));
+            }
+        }
+        out
+    }
+
+    /// Whether this face has a glyph for `ch`.
+    fn has_glyph(face: &(String, Vec<u8>, u32), ch: char) -> bool {
+        ttf_parser::Face::parse(&face.1, face.2)
+            .map(|parsed| parsed.glyph_index(ch).is_some())
+            .unwrap_or(false)
+    }
+
+    /// The picker's list: a machine's families, once each, in order.
+    #[test]
+    fn families_are_listed_once_each_in_order() {
+        let families = Fonts::new().families();
+        assert!(
+            !families.is_empty(),
+            "a machine with no fonts has no titles"
+        );
+        let mut sorted = families.clone();
+        sorted.sort();
+        assert_eq!(families, sorted, "the picker reads them in order");
+        sorted.dedup();
+        assert_eq!(families.len(), sorted.len(), "and names each once");
+    }
+
+    /// A kanji the chosen family has no glyph for is painted by a face that
+    /// has one - and the Latin words beside it keep the chosen family.
+    ///
+    /// The faces are found rather than named: the families a machine has
+    /// are the machine's, and a test that says "Yu Gothic" is a test that
+    /// only runs on Windows.
+    #[test]
+    fn a_kanji_falls_to_a_face_that_has_it() {
+        let fonts = Fonts::new();
+        let installed = installed();
+        let latin = installed
+            .iter()
+            .find(|face| has_glyph(face, 'A') && !has_glyph(face, '日'))
+            .cloned();
+        let japanese: Vec<(String, Vec<u8>, u32)> = installed
+            .iter()
+            .filter(|face| has_glyph(face, '日'))
+            .cloned()
+            .collect();
+        let (Some(latin), false) = (latin, japanese.is_empty()) else {
+            eprintln!("no Latin-only or no kanji face on this machine; skipping");
+            return;
+        };
+
+        // Measured in advances, not in ink: a run falling to another face
+        // sits at a different subpixel place and antialiases a hair
+        // differently, but the pen adds advances exactly - so a line of two
+        // scripts is as wide as its two halves, and a missing-glyph box is
+        // not as wide as the character it stands in for.
+        let width = |content: &str, family: &str| {
+            let mut styled = style(content);
+            styled.font_family = family.to_owned();
+            render(&fonts, &styled, 640, 360)
+                .expect("renders")
+                .block_width
+        };
+        let latin_words = width("AB", &latin.0);
+        // The kanji falling to a face that has them, whichever one it is.
+        let whole: Vec<u32> = japanese
+            .iter()
+            .map(|face| latin_words + width("日本", &face.0))
+            .collect();
+        let mixed = width("AB日本", &latin.0);
+        assert!(
+            whole.iter().any(|expected| expected.abs_diff(mixed) <= 1),
+            "AB日本 set in {} came out {mixed}px wide: {latin_words}px for the words \
+             the family has, and {whole:?} for the kanji in faces that have them - \
+             the kanji was not handed to one of them",
+            latin.0,
+        );
+    }
+
+    /// The fallback run sits on the same pen: a line of two scripts is one
+    /// line, and its block is as tall as any other line's.
+    #[test]
+    fn a_mixed_line_stays_one_block() {
+        let fonts = Fonts::new();
+        let latin = installed()
+            .into_iter()
+            .find(|face| has_glyph(face, 'A') && !has_glyph(face, '日'));
+        let Some(latin) = latin else {
+            eprintln!("no Latin-only face on this machine; skipping");
+            return;
+        };
+        let mut latin_only = style("AB");
+        latin_only.font_family = latin.0.clone();
+        let mut mixed = style("AB日本");
+        mixed.font_family = latin.0.clone();
+        let one = render(&fonts, &latin_only, 640, 360).expect("renders");
+        let both = render(&fonts, &mixed, 640, 360).expect("renders");
+        assert_eq!(
+            both.block_height, one.block_height,
+            "the fallback's run wrapped onto a line of its own"
+        );
+        assert!(both.block_width > one.block_width);
     }
 }
