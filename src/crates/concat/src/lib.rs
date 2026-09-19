@@ -187,6 +187,7 @@ pub fn run() -> Result<(), slint::PlatformError> {
         editor.set_dividers(ModelRc::from(models.dividers.clone()));
         app.set_recents(ModelRc::from(models.recents.clone()));
         editor.set_text_presets(ModelRc::from(models.text_presets.clone()));
+        editor.set_fonts(ModelRc::from(models.fonts.clone()));
     }
 
     // Settings > About's block, gathered once: nothing in it changes while
@@ -818,6 +819,11 @@ pub fn run() -> Result<(), slint::PlatformError> {
     // own once the control's moves pause; see `Studio::clip_commit`.
     editor.on_clip_commit(on_lanes!(|state| {
         state.clip_commit();
+    }));
+
+    // ── the font picker ──
+    editor.on_pick_font(on_window!(|state, family: SharedString| {
+        state.pick_font(family.as_str());
     }));
 
     // ── the chains ──

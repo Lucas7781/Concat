@@ -40,8 +40,9 @@ pub struct Host {
     pub transcriber: Arc<Transcriber>,
     /// Kokoro, and its model downloads.
     pub speech: Arc<Speech>,
-    /// Titles painted to pictures, and the cache of them.
-    pub titles: concat_host::Titles,
+    /// Titles painted to pictures, and the cache of them. Shared, since
+    /// the font list it reads is worth loading on a worker.
+    pub titles: Arc<concat_host::Titles>,
     /// The cutout models, and the masks they find for the project's media.
     pub cutouts: Arc<concat_host::Cutouts>,
     /// The brush model, and the regions it reads under smart strokes.
@@ -63,7 +64,7 @@ impl Host {
         let dirs = AppDirs::locate()?;
         let _ = std::fs::create_dir_all(&dirs.config);
         Ok(Host {
-            titles: concat_host::Titles::new(&dirs),
+            titles: Arc::new(concat_host::Titles::new(&dirs)),
             cutouts: Arc::new(concat_host::Cutouts::new(&dirs.data)),
             brushes: Arc::new(concat_host::Brushes::new(&dirs.data)),
             enhancers: Arc::new(concat_host::Enhancers::new(&dirs.data)),

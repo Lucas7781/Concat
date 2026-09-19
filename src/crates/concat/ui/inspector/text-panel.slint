@@ -33,13 +33,20 @@ import {
 // fraction is what is stored, still.
 export component TextPanel inherits VerticalLayout {
     in property <SelectedClipData> selected;
-    /// The faces this build bundles.
-    in property <[string]> families: ["Hanken Grotesk"];
+    /// Every family a title can be set in: the fonts on this machine, plus
+    /// the ones the project carries; see Editor.fonts.
+    in property <[string]> families;
+    /// Where the selected title's family sits in that list, or -1 when it
+    /// is not one of them.
+    in property <int> family-index: -1;
 
     callback set(field: ClipField, value: float);
     callback set-text(field: ClipTextField, value: string);
     callback set-colour(field: ClipTextField, value: color);
     callback commit();
+    /// A family was picked, by name so the row's index need not be read
+    /// back off the list it came from.
+    callback pick-font(family: string);
 
     // Local editing state, seeded rather than bound — see the note on
     // AdjustPanel, which has the same problem for the same reason. The
@@ -59,7 +66,6 @@ export component TextPanel inherits VerticalLayout {
     property <float> offset-x;
     property <float> offset-y;
     property <int> weight-index;
-    property <int> family-index;
 
     property <[float]> weights: [400, 500, 600, 700];
     /// The label column of the rows whose label is two words.
@@ -87,9 +93,6 @@ export component TextPanel inherits VerticalLayout {
         root.weight-index = root.selected.font-weight >= 700 ? 3
             : root.selected.font-weight >= 600 ? 2
             : root.selected.font-weight >= 500 ? 1 : 0;
-        // One bundled face; a title from an older document that named a
-        // retired one is painted in it too, so it is that row as well.
-        root.family-index = 0;
     }
 
     init => { root.seed(); }
@@ -192,13 +195,13 @@ export component TextPanel inherits VerticalLayout {
         Row {
             label: I18n.t("Font");
             label-width: root.label-w;
+            // Every font on the machine, scrolled through rather than
+            // searched: the list is two hundred rows and the popup scrolls
+            // to any of them.
             Select {
                 options: root.families;
-                current <=> root.family-index;
-                changed(index) => {
-                    root.set-text(ClipTextField.font-family, root.families[index]);
-                    root.commit();
-                }
+                current: root.family-index;
+                changed(index) => { root.pick-font(root.families[index]); }
             }
         }
 

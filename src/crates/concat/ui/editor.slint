@@ -125,6 +125,14 @@ export global Editor {
     callback clip-set-colour(field: ClipTextField, value: color);
     callback clip-commit();
 
+    /// The families a title can be set in, as the font picker's rows:
+    /// every font on the machine, plus the ones the project carries.
+    in-out property <[string]> fonts;
+    /// Where the selected title's family sits in `fonts`, or -1 when it is
+    /// not one of them, or nothing with words is selected.
+    in-out property <int> font-index: -1;
+    callback pick-font(family: string);
+
     // The effect catalogue's shelves, published once, and the selected
     // clip's two chains with a row per parameter. See PresetStack.
     in-out property <[CatalogueEntryData]> catalogue-effects;

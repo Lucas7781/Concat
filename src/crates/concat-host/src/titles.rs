@@ -103,6 +103,39 @@ impl Titles {
         self.clips_with(project, (width, height), (width, height), None)
     }
 
+    /// Every family a title can be set in: the machine's fonts, plus the
+    /// faces the project carries, its own first. What a font picker lists.
+    ///
+    /// This is the first call that reads the system's fonts, which takes a
+    /// moment on a machine with hundreds of them - worth asking for on a
+    /// worker, and the reason it is a method of its own rather than
+    /// something a paint does.
+    pub fn families(&self, project: &Project) -> Vec<String> {
+        let mut fonts = self.fonts.lock().unwrap_or_else(|error| error.into_inner());
+        let fonts = fonts.get_or_insert_with(Fonts::new);
+        let mut carried: Vec<String> = Vec::new();
+        let mut loaded = self.loaded_files.lock().unwrap_or_else(|e| e.into_inner());
+        for font in &project.fonts {
+            // Read once each, as a paint does; a family asked for twice is
+            // the same faces added twice otherwise.
+            if !font.path.is_empty() && loaded.insert(font.path.clone()) {
+                fonts.add_file(Path::new(&font.path));
+            }
+            if !font.family.is_empty() {
+                carried.push(font.family.trim_matches('"').to_owned());
+            }
+        }
+        drop(loaded);
+        let mut families = fonts.families();
+        // The project's own faces first: they are the ones the edit is set
+        // in, and the ones another machine may not have.
+        carried.sort();
+        carried.dedup();
+        families.retain(|family| !carried.contains(family));
+        carried.extend(families);
+        carried
+    }
+
     /// [`Titles::clips`] for a monitor showing a change as it is made: the
     /// title `live` names - the one the gesture is editing - is painted in
     /// memory at `shown`, the monitor's own size, and comes back with its

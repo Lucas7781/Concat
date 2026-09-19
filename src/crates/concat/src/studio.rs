@@ -480,6 +480,8 @@ pub struct Models {
     pub recents: Rc<VecModel<RecentProjectData>>,
     /// The Text page's presets, published once from the loaded list.
     pub text_presets: Rc<VecModel<TextPresetData>>,
+    /// The font picker's rows; see `Studio::load_fonts`.
+    pub fonts: Rc<VecModel<SharedString>>,
 }
 
 impl Models {
@@ -520,6 +522,7 @@ impl Models {
             dividers: Rc::new(VecModel::default()),
             recents: Rc::new(VecModel::default()),
             text_presets: Rc::new(VecModel::default()),
+            fonts: Rc::new(VecModel::default()),
         }
     }
 }
@@ -656,6 +659,9 @@ pub struct Studio {
     /// the ask a burst is due; see [`Studio::request_preview_soon`].
     preview_at: Option<std::time::Instant>,
     preview_timer: slint::Timer,
+    /// Every family a title can be set in, as the painter found them; see
+    /// [`Studio::load_fonts`].
+    fonts: Vec<String>,
     /// What the catalogue shelves were last built from; while nothing in
     /// it changes the shelves are not rebuilt.
     shelf_stamp: std::cell::RefCell<Option<ShelfStamp>>,
@@ -1338,6 +1344,7 @@ impl Studio {
             commit_timer: slint::Timer::default(),
             preview_at: None,
             preview_timer: slint::Timer::default(),
+            fonts: Vec::new(),
             shelf_stamp: std::cell::RefCell::new(None),
             look_art: std::cell::RefCell::new(HashMap::new()),
             packages_watch: slint::Timer::default(),
@@ -3450,6 +3457,54 @@ impl Studio {
         self.request_preview_soon();
     }
 
+    // ── the font picker ──
+
+    /// Asks the title painter for every family this machine offers, and the
+    /// ones the project carries, for the picker to list. On a worker: it is
+    /// the first read of every font on the machine - a second of it, with
+    /// five hundred files installed - and the window is up by then.
+    pub fn load_fonts(&mut self) {
+        let Some(project) = self
+            .session
+            .as_ref()
+            .map(|session| session.project().clone())
+        else {
+            return;
+        };
+        let titles = Arc::clone(&self.host.titles);
+        spawn(
+            move || titles.families(&project),
+            move |studio, _, _, fonts| {
+                studio.fonts = fonts;
+            },
+        );
+    }
+
+    /// The picker's choice: the title is set in that family and the move
+    /// lands like any other inspector's.
+    pub fn pick_font(&mut self, family: &str) {
+        self.clip_set_text(ClipTextField::FontFamily, family);
+        self.clip_commit();
+    }
+
+    /// Where the selected title's family sits among the rows the picker is
+    /// showing, or -1 when the search has hidden it, or nothing with words
+    /// is selected.
+    fn font_index(&self) -> i32 {
+        let family = self
+            .sole_selection()
+            .and_then(|id| self.clip(&id))
+            .and_then(|clip| clip.text.as_ref())
+            .map(|text| text.font_family.trim().trim_matches('"').to_owned());
+        let Some(family) = family else {
+            return -1;
+        };
+        self.fonts
+            .iter()
+            .position(|shown| *shown == family)
+            .map_or(-1, |at| at as i32)
+    }
+
     pub fn clip_set_colour(&mut self, field: ClipTextField, value: slint::Color) {
         let Some(id) = self.sole_selection() else {
             return;
@@ -5094,6 +5149,10 @@ impl Studio {
                 self.request_preview();
                 self.ensure_cutouts();
                 self.ensure_regions();
+                // The font picker's rows are the project's fonts plus the
+                // machine's, so a project brings its own list with it.
+                self.fonts.clear();
+                self.load_fonts();
 
                 // Log missing media to file for debugging
                 if let Some(session) = &self.session {
@@ -5643,6 +5702,18 @@ impl Studio {
         });
 
         editor.set_selected_clip(self.selected());
+        // The font picker's rows, and where the selected title's family
+        // sits among them. `sync` leaves an unchanged row alone, so this
+        // is written once and then only when a project brings its own
+        // fonts with it.
+        sync(
+            &models.fonts,
+            self.fonts
+                .iter()
+                .map(|family| SharedString::from(family.as_str()))
+                .collect(),
+        );
+        editor.set_font_index(self.font_index());
         // Written only when it differs: a fresh model is a change to every
         // binding that reads it, and this one is read on every publish.
         let labels = self.audio_track_labels();
