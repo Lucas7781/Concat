@@ -92,6 +92,24 @@ const LANE_SMALL: f32 = 44.0;
 /// enough that trimming it is a nudge rather than a fight.
 const LAYER_DURATION: f32 = 3.0;
 
+/// How often a control that asks for a preview per move may actually get
+/// one. Every ask flattens the project, paints the title and composites
+/// the frame, so a burst of them - a title being typed, a knob being
+/// dragged - queues behind itself and the words lag behind the picture.
+/// Twelve a second is under the eye's own rate and leaves the event loop
+/// the rest of the time to draw the text being typed.
+const PREVIEW_EVERY: std::time::Duration = std::time::Duration::from_millis(80);
+
+/// How long an ask must wait, given how long ago the last one was; none to
+/// ask now. The throttle's whole decision, so it reads - and is checked -
+/// without a window.
+fn preview_delay(since: Option<std::time::Duration>) -> Option<std::time::Duration> {
+    match since {
+        Some(since) if since < PREVIEW_EVERY => Some(PREVIEW_EVERY - since),
+        _ => None,
+    }
+}
+
 /// One media item's filmstrip, as the lanes tile it.
 pub struct Strip {
     /// Every sampled frame side by side.
@@ -634,6 +652,10 @@ pub struct Studio {
     /// the moves pause; the echo shows the value meanwhile.
     commit_pending: bool,
     commit_timer: slint::Timer,
+    /// When the monitor was last asked for a frame, and the timer that holds
+    /// the ask a burst is due; see [`Studio::request_preview_soon`].
+    preview_at: Option<std::time::Instant>,
+    preview_timer: slint::Timer,
     /// What the catalogue shelves were last built from; while nothing in
     /// it changes the shelves are not rebuilt.
     shelf_stamp: std::cell::RefCell<Option<ShelfStamp>>,
@@ -1314,6 +1336,8 @@ impl Studio {
             flat: None,
             commit_pending: false,
             commit_timer: slint::Timer::default(),
+            preview_at: None,
+            preview_timer: slint::Timer::default(),
             shelf_stamp: std::cell::RefCell::new(None),
             look_art: std::cell::RefCell::new(HashMap::new()),
             packages_watch: slint::Timer::default(),
@@ -1679,6 +1703,35 @@ impl Studio {
         ));
     }
 
+    /// The same ask, at most once every [`PREVIEW_EVERY`].
+    ///
+    /// For the controls that change the picture on every move: a typed
+    /// title asks per keystroke and a knob per pointer step, and each ask
+    /// is a flatten, a title painted and a frame composited. Asked once per
+    /// burst instead, the picture still follows the typing and the event
+    /// loop keeps the time to draw the field being typed into - which is
+    /// what a per-keystroke ask was taking. The trailing ask is what makes
+    /// the last keystroke of a burst reach the monitor.
+    pub fn request_preview_soon(&mut self) {
+        let now = std::time::Instant::now();
+        match preview_delay(self.preview_at.map(|at| now.duration_since(at))) {
+            Some(held) => {
+                self.preview_timer
+                    .start(slint::TimerMode::SingleShot, held, || {
+                        crate::host::Shell::with(|shell, _app| {
+                            let mut studio = shell.studio.borrow_mut();
+                            studio.preview_at = Some(std::time::Instant::now());
+                            studio.request_preview();
+                        });
+                    });
+            }
+            None => {
+                self.preview_at = Some(now);
+                self.request_preview();
+            }
+        }
+    }
+
     /// What the monitor draws at the playhead: the document flattened with
     /// its titles, plus the frame's own additions - a look being shown, a
     /// cutout being painted - and the session's settings. None without a
@@ -1728,18 +1781,26 @@ impl Studio {
                 let scale = f64::from(shown_w) / f64::from(width);
                 let up = |px: u32| (f64::from(px) / scale).round() as u32;
                 let up_off = |px: i32| (f64::from(px) / scale).round() as i32;
-                for title in self
-                    .host
-                    .titles
-                    .clips_live(self.project(), shown_w, shown_h)
-                {
-                    self.title_blocks.insert(
-                        title.clip_id,
+                // Only the clip the gesture is editing is painted in
+                // memory; see `Titles::clips_live`. Its block comes back in
+                // the monitor's pixels and is scaled to the output's, which
+                // the stage measures in - a block read from disk is already
+                // in those terms, so it is taken as it is.
+                for title in self.host.titles.clips_live(
+                    self.project(),
+                    self.sole_selection().as_deref(),
+                    (shown_w, shown_h),
+                    (width, height),
+                ) {
+                    let block = if title.frame.is_some() {
                         (
                             (up(title.block.0), up(title.block.1)),
                             (up_off(title.offset.0), up_off(title.offset.1)),
-                        ),
-                    );
+                        )
+                    } else {
+                        (title.block, title.offset)
+                    };
+                    self.title_blocks.insert(title.clip_id, block);
                     if let Some(frame) = title.frame {
                         self.host
                             .monitor
@@ -3375,7 +3436,9 @@ impl Studio {
         // The words are on the echo now; show them. A title being typed is
         // painted in memory at the monitor's size, the way a grip drag is,
         // so the picture keeps up with the keystrokes while the commit
-        // still lands once, on the way out of the field.
+        // still lands once, on the way out of the field. Asked for at most
+        // [`PREVIEW_EVERY`] though: the raster is cheap, the frame around
+        // it is not, and one per keystroke is a queue the typing waits on.
         //
         // Pending from the first keystroke, not from the field's blur: the
         // echo is dropped by anything that changes the edit - a press on a
@@ -3384,7 +3447,7 @@ impl Studio {
         // the echo alone, and went with it. Nothing starts the timer here;
         // the blur does, and a flush before then lands them too.
         self.commit_pending = true;
-        self.request_preview();
+        self.request_preview_soon();
     }
 
     pub fn clip_set_colour(&mut self, field: ClipTextField, value: slint::Color) {
@@ -7009,7 +7072,7 @@ impl Studio {
 
 #[cfg(test)]
 mod tests {
-    use super::{Footprint, Studio};
+    use super::{Footprint, PREVIEW_EVERY, Studio, preview_delay};
 
     const FRAME: (u32, u32) = (1920, 1080);
 
@@ -7102,5 +7165,34 @@ mod tests {
         let x = 0.5 + 540.0 / 1920.0;
         assert!(box_.contains(x, 0.5 + 6.0 / 1080.0, FRAME));
         assert!(!box_.contains(x, 0.5 - 6.0 / 1080.0, FRAME));
+    }
+
+    /// A burst asks once and then once more when it is due - the first
+    /// keystroke shows at once, the rest wait out the window between
+    /// previews, and the last one is what the held ask carries.
+    #[test]
+    fn a_burst_of_asks_is_held_to_one_preview_each() {
+        use std::time::Duration;
+        assert_eq!(preview_delay(None), None, "nothing has been asked for yet");
+        assert_eq!(
+            preview_delay(Some(Duration::ZERO)),
+            Some(PREVIEW_EVERY),
+            "the keystroke right after one waits out the whole window"
+        );
+        assert_eq!(
+            preview_delay(Some(PREVIEW_EVERY - Duration::from_millis(1))),
+            Some(Duration::from_millis(1)),
+            "and waits only what is left of it"
+        );
+        assert_eq!(
+            preview_delay(Some(PREVIEW_EVERY)),
+            None,
+            "a keystroke past the window is shown at once"
+        );
+        assert_eq!(
+            preview_delay(Some(Duration::from_secs(2))),
+            None,
+            "and one long after it, sooner"
+        );
     }
 }

@@ -42,7 +42,12 @@ export component TextPanel inherits VerticalLayout {
     callback commit();
 
     // Local editing state, seeded rather than bound — see the note on
-    // AdjustPanel, which has the same problem for the same reason.
+    // AdjustPanel, which has the same problem for the same reason. The
+    // words are here for that reason too: a field bound to `selected`
+    // loses its binding to the first keystroke — typing writes to the
+    // field's own `text` — and every title picked afterwards shows the
+    // words of the one before it.
+    property <string> content;
     property <float> size;
     property <float> alpha;
     property <float> stroke-width;
@@ -63,6 +68,12 @@ export component TextPanel inherits VerticalLayout {
     property <float> frame-h: Math.max(1, root.selected.frame-height);
 
     function seed() {
+        // Only when they differ: the echo hands every keystroke straight
+        // back to the inspector through `selected`, and re-assigning a
+        // field the words it already has puts the caret back where it was.
+        if (root.content != root.selected.content) {
+            root.content = root.selected.content;
+        }
         root.size = root.selected.font-size;
         root.alpha = root.selected.text-opacity;
         root.stroke-width = root.selected.stroke-width;
@@ -116,7 +127,7 @@ export component TextPanel inherits VerticalLayout {
                     y: 6px;
                     width: parent.width - 16px;
                     height: parent.height - 12px;
-                    text: root.selected.content;
+                    text <=> root.content;
                     color: Theme.fg;
                     font-size: Theme.fs;
                     // Multi-line: a lower third is routinely two lines, and a
@@ -133,9 +144,13 @@ export component TextPanel inherits VerticalLayout {
                     edited => {
                         root.set-text(ClipTextField.content, self.text);
                     }
+                    // The way out is the commit, so a title being typed is
+                    // one change and not forty. The words themselves went
+                    // over with every keystroke above; sending them again
+                    // here would land them on whatever is selected by the
+                    // time the click that ended the typing is through.
                     changed has-focus => {
                         if (!self.has-focus) {
-                            root.set-text(ClipTextField.content, self.text);
                             root.commit();
                         }
                     }

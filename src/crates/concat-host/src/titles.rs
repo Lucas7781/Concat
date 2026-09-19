@@ -100,20 +100,39 @@ impl Titles {
     /// `width` × `height` frame. A title that fails to paint is left out and
     /// said once on stderr; the rest of the edit still renders.
     pub fn clips(&self, project: &Project, width: u32, height: u32) -> Vec<TitleClip> {
-        self.clips_with(project, width, height, false)
+        self.clips_with(project, (width, height), (width, height), None)
     }
 
-    /// [`Titles::clips`] for a monitor showing a change as it is made:
-    /// every title is painted in memory at `width` by `height` - the
-    /// monitor's own size, not the output's - and comes back with its
+    /// [`Titles::clips`] for a monitor showing a change as it is made: the
+    /// title `live` names - the one the gesture is editing - is painted in
+    /// memory at `shown`, the monitor's own size, and comes back with its
     /// pixels under a name no file has, for the monitor to hold. Nothing
-    /// touches the disk, which is what makes a drag smooth: a PNG per
-    /// pointer step, encoded, written and decoded again, was the lag.
-    pub fn clips_live(&self, project: &Project, width: u32, height: u32) -> Vec<TitleClip> {
-        self.clips_with(project, width, height, true)
+    /// touches the disk for it, which is what makes a keystroke or a
+    /// pointer step cost a raster instead of a PNG encoded and written.
+    ///
+    /// Every other title is read from disk, at `output`, as it is when
+    /// nothing is being edited: its style has not changed, so its PNG is
+    /// already there and the block comes from the memo. Painting all of
+    /// them in memory was the typing lag - a captioned timeline is fifty or
+    /// a hundred titles, and the live cache held sixteen of them, so every
+    /// keystroke repainted the rest at frame size on the event loop.
+    pub fn clips_live(
+        &self,
+        project: &Project,
+        live: Option<&str>,
+        shown: (u32, u32),
+        output: (u32, u32),
+    ) -> Vec<TitleClip> {
+        self.clips_with(project, shown, output, live)
     }
 
-    fn clips_with(&self, project: &Project, width: u32, height: u32, live: bool) -> Vec<TitleClip> {
+    fn clips_with(
+        &self,
+        project: &Project,
+        shown: (u32, u32),
+        output: (u32, u32),
+        live: Option<&str>,
+    ) -> Vec<TitleClip> {
         let timeline = project.active();
         let mut out = Vec::new();
         for clip in &timeline.clips {
@@ -129,11 +148,15 @@ impl Titles {
             };
             let track = &timeline.tracks[index];
             let text = clip.text.clone().unwrap_or_default();
-            let painted = if live {
-                self.painted_live(project, &text, width, height)
+            // Only the title the gesture is changing has pixels nobody has
+            // seen before. The rest are read from disk, which costs a stat
+            // and a memo lookup: repainting a captioned timeline's worth of
+            // them per keystroke is what made typing lag.
+            let painted = if live == Some(clip.id.as_str()) {
+                self.painted_live(project, &text, shown.0, shown.1)
                     .map(|(path, art, frame)| (path, art, Some(frame)))
             } else {
-                self.painted(project, &text, width, height)
+                self.painted(project, &text, output.0, output.1)
                     .map(|(path, art)| (path, art, None))
             };
             let (path, art, frame) = match painted {
@@ -171,8 +194,8 @@ impl Titles {
                     // half-transparent title fades to half, not to solid.
                     opacity: (clip.opacity * text.opacity).clamp(0.0, 1.0),
                     video_filter_chain: video_effect_chain(&clip.video_effects),
-                    media_width: Some(width),
-                    media_height: Some(height),
+                    media_width: Some(shown.0),
+                    media_height: Some(shown.1),
                     has_audio: Some(false),
                     reveal_map: Some(Arc::clone(&art.reveal)),
                     ..ExportClip::blank(ClipKind::Image, clip.start, clip.duration, index)
@@ -587,5 +610,49 @@ mod tests {
             left[0].clip.reveal_map.as_ref().map(|r| &*r.gray)
         );
         let _ = std::fs::remove_dir_all(dirs.data.parent().unwrap());
+    }
+
+    /// A title the gesture is not editing is read from disk: its style has
+    /// not changed, and repainting the whole timeline in memory on every
+    /// keystroke was half a second per keystroke on a captioned timeline.
+    #[test]
+    fn only_the_title_being_edited_is_painted_in_memory() {
+        let dirs = scratch();
+        let mut editor = Editor::new();
+        let mut ids = Vec::new();
+        for start in 0..3 {
+            ids.push(
+                editor
+                    .apply(Command::AddTextClip {
+                        above: false,
+                        track_id: None,
+                        start: start as f64,
+                        style: None,
+                        duration: Some(3.0),
+                        offset_y: Some(0.3),
+                    })
+                    .expect("a title is added")
+                    .created_id
+                    .expect("with an id"),
+            );
+        }
+
+        let titles = Titles::new(&dirs);
+        // A preview of an untouched project, which is what puts every
+        // title's PNG on disk in the first place.
+        assert_eq!(titles.clips(editor.project(), 640, 360).len(), 3);
+
+        let out = titles.clips_live(editor.project(), Some(&ids[1]), (320, 180), (640, 360));
+        assert_eq!(out.len(), 3);
+        for title in &out {
+            let in_memory = title.clip.path.starts_with("memory://");
+            assert_eq!(
+                in_memory,
+                title.clip_id == ids[1],
+                "{} came back {}",
+                title.clip_id,
+                if in_memory { "in memory" } else { "from disk" }
+            );
+        }
     }
 }
