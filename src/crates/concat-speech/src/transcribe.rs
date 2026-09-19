@@ -46,9 +46,14 @@ struct KnownModel {
 
 /// The models the settings panel offers, fastest first.
 ///
-/// All from the official `ggerganov/whisper.cpp` conversions. Nothing bigger
-/// than `small`: `medium` is 1.5 GB and minutes-per-minute on CPU, which is
-/// the opposite of what this feature is for.
+/// All from the official `ggerganov/whisper.cpp` conversions, up to `large`
+/// and its `turbo`. The list used to stop at `small`, on the grounds that a
+/// 1.5 GB model running slower than realtime is the opposite of what the
+/// feature is for - and the sizes say so plainly: everything past `small`
+/// wants a download measured in gigabytes and a machine with the cores to
+/// chew through it. They are here because the trade is the user's to make,
+/// and because `turbo` is the one that pays: near-`large` wording at a
+/// fraction of the wait.
 const KNOWN_MODELS: &[KnownModel] = &[
     KnownModel {
         id: "tiny.en",
@@ -93,8 +98,40 @@ const KNOWN_MODELS: &[KnownModel] = &[
     KnownModel {
         id: "small",
         label: "Small (Multilingual)",
-        blurb: "Best quality offered, any language.",
+        blurb: "Solid wording, any language. A few times slower.",
         approx_bytes: 487_600_000,
+        sha256: "",
+        english_only: false,
+    },
+    KnownModel {
+        id: "medium.en",
+        label: "Medium (English)",
+        blurb: "Much better on hard audio. Slower than realtime on CPU.",
+        approx_bytes: 1_533_774_781,
+        sha256: "",
+        english_only: true,
+    },
+    KnownModel {
+        id: "medium",
+        label: "Medium (Multilingual)",
+        blurb: "Much better wording, any language. Slow on CPU.",
+        approx_bytes: 1_533_763_059,
+        sha256: "",
+        english_only: false,
+    },
+    KnownModel {
+        id: "large-v3-turbo",
+        label: "Large v3 Turbo",
+        blurb: "Near-large quality at a fraction of the wait. 1.6 GB.",
+        approx_bytes: 1_624_555_275,
+        sha256: "",
+        english_only: false,
+    },
+    KnownModel {
+        id: "large-v3",
+        label: "Large v3",
+        blurb: "The best wording Whisper offers. Minutes per minute on CPU.",
+        approx_bytes: 3_095_033_483,
         sha256: "",
         english_only: false,
     },

@@ -260,3 +260,39 @@ bytes = 487600000
 sha256 = ""
 licence = "MIT"
 upstream = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin"
+
+[[model]]
+id = "whisper-medium.en"
+family = "whisper"
+file = "ggml-medium.en.bin"
+bytes = 1533774781
+sha256 = ""
+licence = "MIT"
+upstream = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.en.bin"
+
+[[model]]
+id = "whisper-medium"
+family = "whisper"
+file = "ggml-medium.bin"
+bytes = 1533763059
+sha256 = ""
+licence = "MIT"
+upstream = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.bin"
+
+[[model]]
+id = "whisper-large-v3-turbo"
+family = "whisper"
+file = "ggml-large-v3-turbo.bin"
+bytes = 1624555275
+sha256 = ""
+licence = "MIT"
+upstream = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin"
+
+[[model]]
+id = "whisper-large-v3"
+family = "whisper"
+file = "ggml-large-v3.bin"
+bytes = 3095033483
+sha256 = ""
+licence = "MIT"
+upstream = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3.bin"

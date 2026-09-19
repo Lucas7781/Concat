@@ -88,6 +88,16 @@ pub struct ModelState {
     pub unpacking: bool,
 }
 
+/// A size in the unit that reads best: a caption model is anywhere from
+/// 78 MB to 3.1 GB, and "3095 MB" is a number nobody pictures.
+fn size_phrase(megabytes: f32) -> String {
+    if megabytes >= 1000.0 {
+        format!("{:.1} GB", megabytes / 1000.0)
+    } else {
+        format!("{megabytes:.0} MB")
+    }
+}
+
 impl ModelState {
     /// The model as one row of the sheet's list.
     fn row(&self) -> ModelData {
@@ -97,7 +107,7 @@ impl ModelState {
             id: self.id.as_str().into(),
             name: self.name.as_str().into(),
             note: self.note.as_str().into(),
-            size: format!("{total:.0} MB").into(),
+            size: size_phrase(total).into(),
             accuracy: self.accuracy,
             installed: self.installed,
             active: self.active && self.installed,
@@ -107,6 +117,9 @@ impl ModelState {
             } else {
                 0.0
             },
+            // Megabytes here and not `size_phrase`: the row above says
+            // "1.6 GB", and a bar counting up wants the unit that actually
+            // counts.
             transferred: if self.unpacking {
                 t("Unpacking…").into()
             } else {
@@ -446,6 +459,8 @@ impl SettingsPane {
                             2
                         } else if model.id.starts_with("base") {
                             3
+                        } else if model.id.starts_with("large") {
+                            5
                         } else {
                             4
                         },

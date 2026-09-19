@@ -82,7 +82,7 @@ Concat runs everything on your machine, so the hardware sets the ceiling. The mi
 | **RAM** | **4 GB** | **16 GB** for 4K timelines and the larger caption models |
 | **Storage** | **500 MB** for the app and the smallest caption model | **2 GB** for every optional model, plus room for projects and exports |
 
-Optional models download from the settings panel on first use and then never need the network again: auto-captions 78 MB to 488 MB depending on the whisper size you pick, text-to-speech 132 MB or 349 MB, person cutout 15 MB, object cutout 179 MB, and the cutout brush 40 MB.
+Optional models download from the settings panel on first use and then never need the network again: auto-captions 78 MB to 3.1 GB depending on the whisper size you pick — `turbo` is the big one worth having, near-`large` wording at a fraction of the wait — text-to-speech 132 MB or 349 MB, person cutout 15 MB, object cutout 179 MB, and the cutout brush 40 MB.
 
 ## How to Contribute
 
