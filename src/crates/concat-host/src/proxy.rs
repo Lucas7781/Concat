@@ -173,6 +173,11 @@ pub fn write(source: &str, target: &Path, (width, height): (u32, u32)) -> Result
         }
         encoder.finish().map_err(|error| error.to_string())
     })();
+    // The encoder goes before the rename, not with the end of the function:
+    // it holds the muxer's file open until it is dropped, and Windows will
+    // not rename a file that is open. On Linux it would work either way,
+    // which is where this was written and where its test passed.
+    drop(encoder);
     match result {
         Ok(()) => std::fs::rename(&partial, target)
             .map_err(|error| format!("{}: {error}", target.display())),
