@@ -583,6 +583,10 @@ pub fn run() -> Result<(), slint::PlatformError> {
         else {
             return;
         };
+        // The inspector's words land before the selection goes: cleared
+        // first, the commit they are pending on finds nothing selected and
+        // drops them; see `Studio::flush_commit`.
+        state.flush_commit();
         state.selection.clear();
         state.apply(concat_project::Command::SelectTimeline { timeline_id: id });
     }));
@@ -621,6 +625,9 @@ pub fn run() -> Result<(), slint::PlatformError> {
         else {
             return;
         };
+        // As on a tab switch: what the inspector holds lands while its clip
+        // is still the selected one.
+        state.flush_commit();
         state.selection.clear();
         state.apply(concat_project::Command::RemoveTimeline { timeline_id: id });
     }));
@@ -727,6 +734,12 @@ pub fn run() -> Result<(), slint::PlatformError> {
     }));
     editor.on_band_selected(on_lanes!(
         |state, from: f32, to: f32, from_y: f32, to_y: f32, additive: bool| {
+            // A band is the commonest way out of a title's text field: the
+            // press blurs it, which asks for the commit on a timer, and the
+            // release lands here - clearing the selection the commit is
+            // waiting to be diffed against. Flush first; see
+            // `Studio::flush_commit`.
+            state.flush_commit();
             let (from_row, to_row) = (state.row_at(from_y), state.row_at(to_y));
             let caught: Vec<String> = state
                 .timeline()
@@ -920,6 +933,10 @@ pub fn run() -> Result<(), slint::PlatformError> {
             return;
         }
         if !state.selection.iter().any(|held| held == id.as_str()) {
+            // As anywhere else the selection moves: what the inspector holds
+            // for the clip selected until now lands on that clip, not on the
+            // one right-clicked; see `Studio::flush_commit`.
+            state.flush_commit();
             state.selection = vec![id.to_string()];
         }
         state.menu_target = Some(id.to_string());
