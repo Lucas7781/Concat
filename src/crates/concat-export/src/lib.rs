@@ -84,6 +84,10 @@ pub struct ExportClip {
     /// `Clip::audio_stream`.
     #[serde(default)]
     pub audio_stream: Option<u32>,
+    /// The levels the file is read as, over its own tag; absent reads the
+    /// tag. See the document's `MediaItem::color_range`.
+    #[serde(default)]
+    pub color_range: Option<concat_project::model::ColorRange>,
     /// Whether the clip is footage, sound or a still.
     pub kind: ClipKind,
     /// Seconds into the timeline where the clip begins.
@@ -229,6 +233,7 @@ impl ExportClip {
         ExportClip {
             path: String::new(),
             audio_stream: None,
+            color_range: None,
             kind,
             start,
             duration,
@@ -350,8 +355,36 @@ pub struct ExportRequest {
     /// "not set" and the encoder falls back to VBR.
     #[serde(default)]
     pub bitrate_kbps: u32,
+    /// The levels the file is written in and tagged with, by name:
+    /// "limited" (16-235, what every player expects) or "full" (0-255).
+    /// Limited when a request does not say.
+    /// https://github.com/jub0t/Concat/issues/103
+    #[serde(default, deserialize_with = "range_by_name")]
+    pub color_range: concat_media::ColorRange,
     /// The flattened clip list to render.
     pub clips: Vec<ExportClip>,
+}
+
+/// The engine's word for a document's colour range: the two enums are one
+/// idea kept in two crates, since the document knows nothing of FFmpeg
+/// and the engine nothing of documents.
+pub fn engine_range(range: concat_project::model::ColorRange) -> concat_media::ColorRange {
+    match range {
+        concat_project::model::ColorRange::Limited => concat_media::ColorRange::Limited,
+        concat_project::model::ColorRange::Full => concat_media::ColorRange::Full,
+    }
+}
+
+/// A colour range named the way [`concat_media::ColorRange::name`] names
+/// it, refusing a name the engine does not know rather than quietly
+/// writing video range.
+fn range_by_name<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<concat_media::ColorRange, D::Error> {
+    let name = String::deserialize(deserializer)?;
+    concat_media::ColorRange::parse(&name).ok_or_else(|| {
+        serde::de::Error::custom(format!("unknown colour range {name:?}: limited or full"))
+    })
 }
 
 /// A codec named the way [`VideoCodec::name`] names it, refusing a name
@@ -1019,6 +1052,7 @@ fn render_picture(
         treatments,
         transitions,
         pre_chains,
+        ranges,
         chains,
         reveal_maps,
         cutouts,
@@ -1037,6 +1071,7 @@ fn render_picture(
             rate_mode: request.rate_mode,
             bitrate_kbps: request.bitrate_kbps,
             ten_bit: request.ten_bit,
+            color_range: request.color_range,
             hardware: true,
             threads: 0,
         },
@@ -1077,6 +1112,7 @@ fn render_picture(
                     stills.contains(&layer.clip),
                     chain,
                     pre,
+                    ranges.get(&layer.clip).copied(),
                 ) {
                     let frame = cutouts
                         .get(&layer.clip)
@@ -1116,7 +1152,8 @@ fn render_picture(
                     let mut options = DecodeOptions::default()
                         .starting_at(layer.source_time)
                         .scaled_to(decode_width, decode_height)
-                        .at_rate(decode_rate);
+                        .at_rate(decode_rate)
+                        .in_range(ranges.get(&layer.clip).copied());
 
                     // Effects and transition fades, as one FFmpeg chain. The
                     // decoder guards the frame size after it, so an effect
@@ -1504,6 +1541,7 @@ fn frame_request(
         .prefiltered(pre)
         .filtered(chain)
         .from_proxy(proxy)
+        .in_range(plan.built.ranges.get(&layer.clip).copied())
 }
 
 /// [`preview_sources`] for one instant of a plan already built. With
@@ -1524,6 +1562,7 @@ pub fn preview_sources_of(
         treatments,
         transitions,
         pre_chains,
+        ranges: _,
         chains,
         reveal_maps,
         cutouts,
@@ -1666,6 +1705,7 @@ pub fn preview_plan(
         ten_bit: false,
         rate_mode: RateMode::Vbr,
         bitrate_kbps: 0,
+        color_range: concat_media::ColorRange::Limited,
         clips: Vec::new(),
     };
     PreviewPlan {
@@ -1775,6 +1815,74 @@ pub fn preview_moments(
 
 #[cfg(test)]
 mod tests {
+    /// Every built-in package's FFmpeg chain builds a filter graph.
+    ///
+    /// A package's fixtures compare its chain as *text*, so a chain FFmpeg
+    /// cannot parse passes them for as long as the fixture is wrong in the
+    /// same way - which is what had happened to the two colour keys, where
+    /// `color=0x00FF00:similarity=` was written `color=0x00FF00ty=`: the
+    /// fixtures agreed with the template, and nothing asked FFmpeg until a
+    /// frame was rendered and the whole preview failed. This asks it, for
+    /// every package at its defaults.
+    ///
+    /// Video kinds only, and only the chains that fit a clip's slot in the
+    /// graph: a chain with pads of its own (`split[a][b];...`) is refused
+    /// by `validate_chain` by design and is carried by a shader pass
+    /// instead.
+    #[test]
+    fn every_package_chain_builds_a_filter_graph() {
+        use concat_effects::manifest::Kind;
+        use concat_project::model::AppliedFilter;
+
+        let path =
+            std::env::temp_dir().join(format!("concat-chain-test-{}.mp4", std::process::id()));
+        let mut encoder =
+            Encoder::create(&path, 64, 64, FrameRate::THIRTY, &EncodeOptions::default())
+                .expect("encodes");
+        let mut frame = Frame::black(64, 64);
+        frame.fill([40, 160, 90, 255]);
+        for _ in 0..4 {
+            encoder.write_frame(&frame).expect("writes");
+        }
+        encoder.finish().expect("finishes");
+
+        let catalogue = Catalogue::builtin();
+        let mut failures: Vec<String> = Vec::new();
+        for package in catalogue.packages() {
+            let kind = package.kind();
+            if kind != Kind::Effect && kind != Kind::Filter {
+                continue;
+            }
+            let applied = [AppliedFilter::new(&package.manifest.effect.id)];
+            let chain = catalogue.video_chain(&applied);
+            if chain.is_empty() || chain.contains('[') || chain.contains(';') {
+                continue;
+            }
+            let decoded = Decoder::open(
+                &path,
+                &DecodeOptions::default().scaled_to(64, 64).filtered(&chain),
+            )
+            .and_then(|mut decoder| decoder.next_frame());
+            match decoded {
+                Ok(Some(_)) => {}
+                Ok(None) => failures.push(format!(
+                    "{}: no frame from {chain}",
+                    package.manifest.effect.id
+                )),
+                Err(error) => failures.push(format!(
+                    "{}: {error} from {chain}",
+                    package.manifest.effect.id
+                )),
+            }
+        }
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            failures.is_empty(),
+            "chains that do not build:\n{}",
+            failures.join("\n")
+        );
+    }
+
     /// A treatment on track 1 runs over what track 0 drew and not over what
     /// track 2 draws on top of it, and its strength blends the result back.
     #[test]
@@ -1840,12 +1948,7 @@ mod tests {
             strength: 0.5,
             ..negate.clone()
         };
-        let out = composite_treated(
-            &mut compositor,
-            stack(Rational::from_int(1)),
-            &[half],
-            &[],
-        );
+        let out = composite_treated(&mut compositor, stack(Rational::from_int(1)), &[half], &[]);
         let pixel = &out.pixels()[(7 * 8 + 7) * 4..(7 * 8 + 7) * 4 + 3];
         assert!(pixel[0] > 120 && pixel[0] < 136, "{pixel:?}");
         assert!(pixel[1] > 120 && pixel[1] < 136, "{pixel:?}");
@@ -2010,7 +2113,10 @@ mod tests {
         let spans = resolve_transitions(&mut clips, FrameRate::THIRTY, true);
 
         let b = &clips[1];
-        assert_eq!(b.start, 3.0, "extends backwards over the cut, like a dissolve");
+        assert_eq!(
+            b.start, 3.0,
+            "extends backwards over the cut, like a dissolve"
+        );
         assert_eq!(b.duration, 5.0);
         assert_eq!(b.video_fade_in, 1.0, "the GPU-less fallback dissolve");
         assert_eq!(b.track, 1);

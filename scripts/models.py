@@ -13,13 +13,21 @@ says what they are and where they come from; this script is what fills the
 mirror from upstream, and what turns the table into the manifest.json every
 release ships beside its bundles. See that file for the shape of a row.
 """
+from __future__ import annotations
+
 import argparse
 import hashlib
 import json
 import pathlib
 import re
 import sys
-import tomllib
+try:
+    import tomllib
+except ModuleNotFoundError:
+    try:
+        import tomli as tomllib
+    except ModuleNotFoundError:
+        tomllib = None
 import urllib.request
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -49,9 +57,11 @@ BUNDLES = [
     ("linux", "x86_64", "deb", "Concat-{v}-linux-x86_64.deb"),
     ("linux", "x86_64", "rpm", "Concat-{v}-linux-x86_64.rpm"),
     ("linux", "x86_64", "appimage", "Concat-{v}-linux-x86_64.AppImage"),
+    ("linux", "x86_64", "pacman", "Concat-{v}-linux-x86_64.pkg.tar.zst"),
     ("linux", "aarch64", "deb", "Concat-{v}-linux-aarch64.deb"),
     ("linux", "aarch64", "rpm", "Concat-{v}-linux-aarch64.rpm"),
     ("linux", "aarch64", "appimage", "Concat-{v}-linux-aarch64.AppImage"),
+    ("linux", "aarch64", "pacman", "Concat-{v}-linux-aarch64.pkg.tar.zst"),
     ("windows", "x86_64", "setup", "Concat-{v}-windows-x86_64-setup.exe"),
     ("windows", "x86_64", "msi", "Concat-{v}-windows-x86_64.msi"),
     ("windows", "aarch64", "setup", "Concat-{v}-windows-aarch64-setup.exe"),
@@ -62,7 +72,34 @@ BUNDLES = [
 
 
 def table() -> dict:
-    return tomllib.loads(MANIFEST.read_text(encoding="utf-8"))
+    text = MANIFEST.read_text(encoding="utf-8")
+    if tomllib is not None:
+        return tomllib.loads(text)
+    data: dict = {"model": []}
+    current: dict | None = None
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line == "[[model]]":
+            current = {}
+            data["model"].append(current)
+            continue
+        if "=" in line:
+            k, v = line.split("=", 1)
+            k = k.strip()
+            v = v.strip()
+            if v.startswith('"') and v.endswith('"'):
+                val = v[1:-1]
+            elif v.isdigit():
+                val = int(v)
+            else:
+                val = v
+            if current is not None:
+                current[k] = val
+            else:
+                data[k] = val
+    return data
 
 
 def hf_mirror(url: str) -> str | None:
@@ -158,7 +195,7 @@ def check() -> int:
     # against a digest nothing was mirrored under can never pass.
     for family, path in TABLES.items():
         rows = [model for model in models if model.get("family") == family]
-        text = path.read_text(encoding="utf-8").split("#[cfg(test)]")[0]
+        text = re.split(r'\n(?:#\[cfg\(test\)\]\s*)?mod tests?\s*\{', path.read_text(encoding="utf-8"))[0]
         ids = set(re.findall(r'^\s*(?:pub )?id: "([^"]+)"', text, re.M))
         if family == "cutout":
             ids = set(re.findall(r'^\s*file: "([^"]+)"', text, re.M))
